@@ -29,14 +29,18 @@ ShairportSync=shairport-sync
 # and Beocreate cards, see issue #43.
 #
 # control=dsp writes the HiFiBerry DSP volume register through
-# sigmatcpserver (start it with --enable-rest). This affects every source
-# that passes through the DSP, including optical.
+# sigmatcpserver. Uses SigmaTCP (port 8086) by default, which is available on
+# every HiFiBerryOS install. Falls back to REST (port 13141) when
+# sigmatcpserver runs with --enable-rest. Affects every source that passes
+# through the DSP, including optical.
 control=alsa
 mixer_control=Master
 
 # Only used when control=dsp:
+#transport=auto        # auto | sigmatcp | rest
 #dsp_host=localhost
-#dsp_port=13141
+#dsp_port=8086         # SigmaTCP
+#dsp_rest_port=13141   # REST fallback
 #dbrange=60
 
 [metadata_post]

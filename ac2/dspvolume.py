@@ -28,23 +28,32 @@ import logging
 import requests
 
 # Why this module exists:
-# On HiFiBerry DAC+ DSP / Beocreate and similar DSP cards, audio coming from the
-# optical (S/PDIF) input is processed by the DSP hardware and never flows through
-# the ALSA software mixer. That means alsaaudio.Mixer("Master").setvolume() has
-# no effect on optical playback — the GUI slider moves but nothing audible
-# changes (see https://github.com/hifiberry/audiocontrol2/issues/43).
+# On HiFiBerry DAC+ DSP / Beocreate and similar DSP cards, audio coming from
+# the optical (S/PDIF) input is processed by the DSP hardware and never flows
+# through the ALSA software mixer. That means alsaaudio.Mixer("Master"|"Softvol")
+# .setvolume() has no effect on optical playback - the GUI slider moves but
+# nothing audible changes (see issue #43).
 #
-# DSPVolume writes directly to the DSP's volumeControlRegister via the
-# sigmatcpserver REST API (port 13141 by default). This affects every source
-# that passes through the DSP, including optical.
+# DSPVolume writes directly to the DSP's volumeControlRegister via
+# sigmatcpserver. That register sits inside the DSP signal path, so it
+# affects every source, including optical.
+#
+# Two transports are supported:
+#   1. SigmaTCP (port 8086, the stock HiFiBerryOS setup) via the
+#      hifiberrydsp.client.sigmatcp.SigmaTCPClient that ships with the OS.
+#      This is tried first because it works on every HiFiBerryOS install
+#      without any sigmatcpserver reconfiguration.
+#   2. REST (port 13141) as a fallback when hifiberrydsp isn't importable
+#      but sigmatcpserver was started with --enable-rest.
+#
+# You can force a specific transport via the `transport` config option
+# (values: "auto", "sigmatcp", "rest").
 
 
-# dB-range that maps 0–100% to the log volume curve. 60 dB matches dsptoolkit's
-# default and keeps the perceived response comparable to other HiFiBerry tools.
 DEFAULT_DBRANGE = 60
 
-# Log coefficients for a 60 dB range, copied from hifiberrydsp.filtering.volume
-# so this module stays free of the hifiberrydsp package dependency.
+# Log coefficients, copied from hifiberrydsp.filtering.volume so the REST
+# path stays free of the hifiberrydsp package dependency.
 _LOG_COEFFS = {
     50: (0.0031623, 5.757),
     60: (0.001, 6.908),
@@ -63,8 +72,6 @@ def _log_coefficients(dbrange):
 
 
 def percent_to_amplification(percent, dbrange=DEFAULT_DBRANGE):
-    # Map 0–100 % to a linear amplification factor on a log curve so that
-    # perceived loudness changes roughly evenly across the slider.
     if percent <= 0:
         return 0.0
     if percent >= 100:
@@ -82,15 +89,135 @@ def amplification_to_percent(amplification, dbrange=DEFAULT_DBRANGE):
     return round((math.log(amplification / a) / b) * 100)
 
 
+# -- Transports --------------------------------------------------------------
+
+
+class _SigmaTCPTransport:
+    """Talks to sigmatcpserver on TCP port 8086 via the client shipped with
+    HiFiBerryOS. Works out of the box on every stock HiFiBerryOS install."""
+
+    def __init__(self, host="127.0.0.1", port=8086):
+        # Import lazily so the REST fallback still works when hifiberrydsp
+        # isn't installed.
+        from hifiberrydsp.client.sigmatcp import SigmaTCPClient
+        from hifiberrydsp.hardware.adau145x import Adau145x
+
+        self._client = SigmaTCPClient(Adau145x, host, port=port)
+        self._register = None
+
+    def resolve_register(self):
+        # request_metadata can return "1234" or "1234/5" (address/length).
+        raw = self._client.request_metadata("volumeControlRegister")
+        if raw is None or raw == "":
+            return None
+        addr = str(raw).strip().split("/")[0]
+        self._register = int(addr, 0)  # 0 -> auto-detect hex/dec
+        return self._register
+
+    def read(self):
+        if self._register is None:
+            return None
+        return self._client.read_decimal(self._register)
+
+    def write(self, amplification):
+        if self._register is None:
+            return False
+        self._client.write_decimal(self._register, amplification)
+        return True
+
+    def describe(self):
+        return "SigmaTCP reg=0x{:x}".format(self._register or 0)
+
+
+class _RestTransport:
+    """Talks to sigmatcpserver's REST API (port 13141 by default). Requires
+    sigmatcpserver to be running with --enable-rest."""
+
+    def __init__(self, host="localhost", port=13141, timeout=2.0):
+        self._base = "http://{}:{}".format(host, port)
+        self._timeout = timeout
+        self._register = None
+
+    def resolve_register(self):
+        r = requests.get("{}/metadata".format(self._base),
+                         timeout=self._timeout)
+        r.raise_for_status()
+        meta = r.json()
+        raw = meta.get("volumeControlRegister")
+        if raw is None:
+            return None
+        addr = str(raw).strip().split("/")[0]
+        self._register = int(addr, 0)
+        return self._register
+
+    def read(self):
+        if self._register is None:
+            return None
+        url = "{}/memory/{}?format=float".format(self._base, self._register)
+        r = requests.get(url, timeout=self._timeout)
+        r.raise_for_status()
+        values = r.json().get("values", [])
+        return float(values[0]) if values else None
+
+    def write(self, amplification):
+        if self._register is None:
+            return False
+        payload = {"address": self._register, "value": [amplification]}
+        r = requests.post("{}/memory".format(self._base),
+                          json=payload, timeout=self._timeout)
+        r.raise_for_status()
+        return True
+
+    def describe(self):
+        return "REST reg=0x{:x}".format(self._register or 0)
+
+
+def _pick_transport(mode, host, port, rest_port):
+    """Return a transport instance with the register already resolved, or
+    None if no transport could be established."""
+    attempts = []
+    if mode in ("auto", "sigmatcp"):
+        attempts.append(("sigmatcp",
+                         lambda: _SigmaTCPTransport(host=host, port=port)))
+    if mode in ("auto", "rest"):
+        attempts.append(("rest",
+                         lambda: _RestTransport(host=host, port=rest_port)))
+
+    for name, factory in attempts:
+        try:
+            t = factory()
+            reg = t.resolve_register()
+            if reg is None:
+                logging.warning(
+                    "DSPVolume: %s transport reached the DSP but "
+                    "volumeControlRegister metadata is missing (profile "
+                    "without volume control?)", name)
+                continue
+            logging.info("DSPVolume: using %s", t.describe())
+            return t
+        except ImportError as e:
+            logging.debug("DSPVolume: %s transport unavailable: %s", name, e)
+        except Exception as e:
+            logging.warning("DSPVolume: %s transport failed: %s", name, e)
+    return None
+
+
+# -- Public class ------------------------------------------------------------
+
+
 class DSPVolume(threading.Thread):
     """Volume controller that writes to the HiFiBerry DSP volume register.
 
     Exposes the same interface as ALSAVolume so it can be used as a drop-in
-    replacement in audiocontrol2.py. Requires sigmatcpserver to be running
-    with --enable-rest (default on current HiFiBerryOS images)."""
+    replacement in audiocontrol2.py."""
 
-    def __init__(self, host="localhost", port=13141, dbrange=DEFAULT_DBRANGE,
-                 poll_interval=0.5, timeout=2.0):
+    def __init__(self,
+                 host="localhost",
+                 port=8086,
+                 rest_port=13141,
+                 transport="auto",
+                 dbrange=DEFAULT_DBRANGE,
+                 poll_interval=0.5):
         super().__init__()
 
         self.listeners = []
@@ -98,79 +225,35 @@ class DSPVolume(threading.Thread):
         self.unmuted_volume = 0
         self.pollinterval = max(0.1, poll_interval)
         self.dbrange = dbrange
-        self.timeout = timeout
-        self.base_url = "http://{}:{}".format(host, port)
-        # Cached register address resolved from /metadata on first use.
-        self.register_addr = None
 
-        # Resolve the register address once at startup so later set_volume()
-        # calls don't have to hit /metadata every time.
-        try:
-            self.register_addr = self._resolve_register()
-            if self.register_addr is None:
-                logging.error(
-                    "DSPVolume: volumeControlRegister not found in DSP "
-                    "metadata (is a DSP profile loaded?)")
-        except Exception as e:
-            logging.error("DSPVolume: failed to resolve volume register: %s", e)
-
-    # -- HTTP helpers ---------------------------------------------------------
-
-    def _resolve_register(self):
-        url = "{}/metadata".format(self.base_url)
-        r = requests.get(url, timeout=self.timeout)
-        r.raise_for_status()
-        meta = r.json()
-        reg = meta.get("volumeControlRegister")
-        if reg is None:
-            return None
-        return self._parse_int(reg)
-
-    @staticmethod
-    def _parse_int(value):
-        # Metadata values can be plain decimals, hex ("0x1234") or the
-        # dsptoolkit-style "1234/5" (address/length). We only need the address.
-        if isinstance(value, int):
-            return value
-        text = str(value).strip().split("/")[0]
-        if text.lower().startswith("0x"):
-            return int(text, 16)
-        return int(text)
-
-    def _read_register(self):
-        if self.register_addr is None:
-            return None
-        url = "{}/memory/{}?format=float".format(self.base_url,
-                                                 self.register_addr)
-        r = requests.get(url, timeout=self.timeout)
-        r.raise_for_status()
-        values = r.json().get("values", [])
-        if not values:
-            return None
-        return float(values[0])
-
-    def _write_register(self, amplification):
-        if self.register_addr is None:
-            return False
-        url = "{}/memory".format(self.base_url)
-        payload = {"address": self.register_addr, "value": [amplification]}
-        r = requests.post(url, json=payload, timeout=self.timeout)
-        r.raise_for_status()
-        return True
+        self._transport = _pick_transport(
+            mode=transport,
+            host=host,
+            port=port,
+            rest_port=rest_port,
+        )
+        if self._transport is None:
+            logging.error(
+                "DSPVolume: no working transport to sigmatcpserver; "
+                "volume control via the DSP will be a no-op. Check that "
+                "sigmatcpserver is running and exposes either TCP (:8086) "
+                "or the REST API (:13141, --enable-rest).")
 
     # -- Public interface (matches ALSAVolume) --------------------------------
 
     def set_volume(self, vol):
-        # Track the last non-zero volume so unmute can restore it later.
         if vol == 0 and self.volume != 0:
             self.unmuted_volume = self.volume
 
         if vol == self.volume:
             return
 
+        if self._transport is None:
+            return
+
         amp = percent_to_amplification(vol, self.dbrange)
         try:
-            self._write_register(amp)
+            self._transport.write(amp)
         except Exception as e:
             logging.error("DSPVolume: failed to set volume to %s%%: %s",
                           vol, e)
@@ -182,7 +265,6 @@ class DSPVolume(threading.Thread):
             newvol = 0
         elif newvol > 100:
             newvol = 100
-
         self.set_volume(newvol)
 
     def set_mute(self, mute):
@@ -225,8 +307,11 @@ class DSPVolume(threading.Thread):
                                   e, listener)
 
     def current_volume(self):
+        if self._transport is None:
+            return self.volume if self.volume >= 0 else 0
+
         try:
-            amp = self._read_register()
+            amp = self._transport.read()
         except Exception as e:
             logging.debug("DSPVolume: read failed: %s", e)
             return self.volume if self.volume >= 0 else 0

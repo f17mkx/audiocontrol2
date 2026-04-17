@@ -225,13 +225,23 @@ def parse_config(debugmode=False):
 
         if control_type == "dsp":
             dsp_host = config.get("volume", "dsp_host", fallback="localhost")
-            dsp_port = config.getint("volume", "dsp_port", fallback=13141)
+            # SigmaTCP (8086) is the default because it's always available on
+            # stock HiFiBerryOS. REST (13141) only works when sigmatcpserver
+            # is started with --enable-rest. Users can force one or the other
+            # via transport=sigmatcp|rest|auto.
+            dsp_port = config.getint("volume", "dsp_port", fallback=8086)
+            rest_port = config.getint("volume", "dsp_rest_port",
+                                      fallback=13141)
+            transport = config.get("volume", "transport",
+                                   fallback="auto").strip().lower()
             dbrange = config.getint("volume", "dbrange", fallback=60)
             volume_control = DSPVolume(host=dsp_host,
                                        port=dsp_port,
+                                       rest_port=rest_port,
+                                       transport=transport,
                                        dbrange=dbrange)
-            logging.info("using DSP volume control at %s:%s",
-                         dsp_host, dsp_port)
+            logging.info("using DSP volume control at %s (transport=%s)",
+                         dsp_host, transport)
         else:
             mixer_name = config.get("volume",
                                     "mixer_control",
