@@ -234,6 +234,24 @@ def parse_config(debugmode=False):
         logging.info("volume control not configured, "
                      "disabling volume control support")
 
+    # External plugin directory.
+    # Users can drop Python modules (.py files or packages) into plugin_dir and
+    # reference them from [controller:module.Class] or [metadata:module.Class]
+    # sections below. Without this, those sections can only load classes that
+    # are importable from the system sys.path (i.e. installed ac2 plugins).
+    # See doc/extensions.md and issue #33.
+    if "plugins" in config.sections():
+        plugin_dir = config.get("plugins", "plugin_dir", fallback=None)
+        if plugin_dir:
+            if os.path.isdir(plugin_dir):
+                if plugin_dir not in sys.path:
+                    sys.path.insert(0, plugin_dir)
+                logging.info("added plugin directory %s to sys.path",
+                             plugin_dir)
+            else:
+                logging.error(
+                    "plugin_dir %s does not exist, skipping", plugin_dir)
+
     # Additional controller modules
     for section in config.sections():
         if section.startswith("controller:"):
@@ -262,11 +280,76 @@ def parse_config(debugmode=False):
                 params = config[section]
                 metadata_display = create_object(classname, params)
                 mpris.register_metadata_display(metadata_display)
-                volume_control.add_listener(metadata_display)
+                # Only attach to the volume control if one is configured;
+                # otherwise this raised AttributeError and prevented the
+                # metadata plugin from loading at all (#33).
+                if volume_control is not None:
+                    volume_control.add_listener(metadata_display)
                 logging.info("registered metadata display %s", metadata_display)
                 report_activate("audiocontrol_metadata_" + classname)
             except Exception as e:
                 logging.error("Exception during controller %s initialization",
+                              classname)
+                logging.exception(e)
+
+        # Generic plugin section: instantiate the class and auto-register it
+        # for whatever interfaces it implements. This lets users drop a single
+        # [plugin:module.Class] entry in the config without having to know
+        # whether the plugin is a metadata display, a controller, or both
+        # (e.g. a physical controller that also reacts to now-playing info).
+        if section.startswith("plugin:"):
+            [_, classname] = section.split(":", 1)
+            try:
+                params = config[section]
+                plugin = create_object(classname, params)
+                if plugin is None:
+                    continue
+
+                registered = []
+
+                # Metadata display: anything with a .notify(metadata) method.
+                if callable(getattr(plugin, "notify", None)):
+                    mpris.register_metadata_display(plugin)
+                    registered.append("metadata_display")
+
+                # Controller-style plugin: has set_player_control /
+                # set_volume_control and is a Thread we should start.
+                if callable(getattr(plugin, "set_player_control", None)):
+                    plugin.set_player_control(mpris)
+                    registered.append("player_control")
+                if callable(getattr(plugin, "set_volume_control", None)):
+                    plugin.set_volume_control(volume_control)
+                    registered.append("volume_control")
+                if callable(getattr(plugin, "update_playback_state", None)):
+                    mpris.register_state_display(plugin)
+                    registered.append("state_display")
+
+                # Volume listener: has notify_volume(percent).
+                if volume_control is not None and \
+                        callable(getattr(plugin, "notify_volume", None)):
+                    volume_control.add_listener(plugin)
+                    if "volume_listener" not in registered:
+                        registered.append("volume_listener")
+
+                # Start background plugins that look like Threads.
+                if callable(getattr(plugin, "start", None)) and \
+                        hasattr(plugin, "run"):
+                    try:
+                        plugin.start()
+                    except RuntimeError:
+                        # Thread already started or can't be started twice.
+                        pass
+
+                if registered:
+                    logging.info("registered plugin %s as %s",
+                                 classname, ", ".join(registered))
+                    report_activate("audiocontrol_plugin_" + classname)
+                else:
+                    logging.warning(
+                        "plugin %s did not expose any known interface; "
+                        "instantiated but not wired up", classname)
+            except Exception as e:
+                logging.error("Exception during plugin %s initialization",
                               classname)
                 logging.exception(e)
 

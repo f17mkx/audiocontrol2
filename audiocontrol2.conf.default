@@ -34,6 +34,12 @@ url=http://127.0.0.1:80/sound/volume
 [privacy]
 external_metadata=1
 
+# External plugins (see doc/extensions.md). Uncomment plugin_dir and drop your
+# .py files into that directory to load them via [metadata:...],
+# [controller:...] or the generic [plugin:module.Class] section.
+#[plugins]
+#plugin_dir=/data/ac2plugins
+
 [controller:ac2.plugins.control.keyboard.Keyboard]
 
 #[controller:ac2.plugins.control.rotary.Rotary]
