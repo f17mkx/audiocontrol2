@@ -19,14 +19,20 @@ implement more than one on the same class.
 
 ### Metadata display
 
-Receives updates whenever the now-playing metadata changes.
+Receives updates whenever the now-playing metadata changes. **Inherit from
+`ac2.plugins.metadata.MetadataDisplay`** so your class picks up the
+`notify_async()` wrapper that the dispatcher actually calls - without it,
+every metadata update will raise `AttributeError: 'YourClass' object has no
+attribute 'notify_async'`.
 
 ```python
-class MyDisplay:
+from ac2.plugins.metadata import MetadataDisplay
+
+class MyDisplay(MetadataDisplay):
     def __init__(self, params=None):
+        super().__init__()
         # params is the `configparser` section, so you can read options
         # from the [plugin:...] / [metadata:...] block.
-        pass
 
     def notify(self, metadata):
         # metadata is an ac2.metadata.Metadata instance
@@ -112,8 +118,11 @@ device=/dev/ledring0
 ```
 
 ```python
-class LedMonitor:
+from ac2.plugins.metadata import MetadataDisplay
+
+class LedMonitor(MetadataDisplay):
     def __init__(self, params):
+        super().__init__()
         self.device = params.get("device")
 
     def notify(self, metadata):
@@ -122,6 +131,10 @@ class LedMonitor:
     def notify_volume(self, percent):
         ...
 ```
+
+> If the plugin exposes `notify()` but does not also inherit `MetadataDisplay`,
+> metadata events will crash as soon as the dispatcher tries to call
+> `notify_async()`. Stick to the pattern above.
 
 If the class does not expose any of the interfaces above, it is instantiated
 but not connected to anything, and a warning is logged.
