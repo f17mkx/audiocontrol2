@@ -23,7 +23,21 @@ lms=lmsmpris
 ShairportSync=shairport-sync
 
 [volume]
+# control=alsa (default) drives the ALSA software mixer. Works for every
+# source that flows through ALSA (AirPlay, Spotify, MPD, ...). It does NOT
+# affect sources that bypass ALSA - notably the optical input on DAC+ DSP
+# and Beocreate cards, see issue #43.
+#
+# control=dsp writes the HiFiBerry DSP volume register through
+# sigmatcpserver (start it with --enable-rest). This affects every source
+# that passes through the DSP, including optical.
+control=alsa
 mixer_control=Master
+
+# Only used when control=dsp:
+#dsp_host=localhost
+#dsp_port=13141
+#dbrange=60
 
 [metadata_post]
 url=http://127.0.0.1:80/sources/metadata

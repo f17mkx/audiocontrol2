@@ -43,6 +43,7 @@ import ac2.data.lastfm as lastfmdata
 
 from ac2.plugins.metadata.lastfm import LastFMScrobbler
 from ac2.alsavolume import ALSAVolume
+from ac2.dspvolume import DSPVolume
 from ac2.metadata import Metadata
 import ac2.metadata
 from ac2.data.mpd import MpdMetadataProcessor
@@ -210,15 +211,36 @@ def parse_config(debugmode=False):
                          player, services)
 
     # Volume
+    # Two backends are supported:
+    #   control=alsa (default): ALSA software mixer. Works for streams that
+    #     flow through ALSA (AirPlay, Spotify, MPD, etc).
+    #   control=dsp: writes the HiFiBerry DSP volume register via
+    #     sigmatcpserver. Required for sources that bypass ALSA, e.g. the
+    #     optical input on DAC+ DSP and Beocreate cards (issue #43).
     volume_control = None
     if "volume" in config.sections():
-        mixer_name = config.get("volume",
-                                "mixer_control",
-                                fallback=None)
-        if mixer_name is not None:
-            volume_control = ALSAVolume(mixer_name)
-            logging.info("monitoring mixer %s", mixer_name)
+        control_type = config.get("volume",
+                                  "control",
+                                  fallback="alsa").strip().lower()
 
+        if control_type == "dsp":
+            dsp_host = config.get("volume", "dsp_host", fallback="localhost")
+            dsp_port = config.getint("volume", "dsp_port", fallback=13141)
+            dbrange = config.getint("volume", "dbrange", fallback=60)
+            volume_control = DSPVolume(host=dsp_host,
+                                       port=dsp_port,
+                                       dbrange=dbrange)
+            logging.info("using DSP volume control at %s:%s",
+                         dsp_host, dsp_port)
+        else:
+            mixer_name = config.get("volume",
+                                    "mixer_control",
+                                    fallback=None)
+            if mixer_name is not None:
+                volume_control = ALSAVolume(mixer_name)
+                logging.info("monitoring mixer %s", mixer_name)
+
+        if volume_control is not None:
             if server is not None:
                 volume_control.add_listener(server)
                 server.set_volume_control(volume_control)
